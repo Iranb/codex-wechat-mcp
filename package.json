@@ -1,0 +1,35 @@
+{
+  "name": "codex-wechat-mcp",
+  "version": "0.1.0",
+  "description": "Owner-bound WeChat forwarding through a dedicated Codex CLI session with private attachment processing and macOS login services",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Iranb/codex-wechat-mcp.git"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "login": "node src/setup.mjs login",
+    "bind": "node src/setup.mjs bind",
+    "configure": "node src/configure.mjs",
+    "start": "node src/main.mjs --live --mode local-queue --new-only",
+    "local": "node src/local.mjs",
+    "exec:prepare": "node src/exec.mjs prepare --live",
+    "exec:start": "node src/exec-runtime.mjs start --live",
+    "exec:status": "node src/exec-runtime.mjs status --live",
+    "exec:stop": "node src/exec-runtime.mjs stop --live",
+    "service:plan": "node src/service.mjs plan",
+    "service:install": "node src/service.mjs install",
+    "service:load": "node src/service.mjs load",
+    "service:status": "node src/service.mjs status",
+    "service:stop": "node src/service.mjs stop",
+    "service:uninstall": "node src/service.mjs uninstall",
+    "sessions:list": "node src/list.mjs sessions",
+    "models:list": "node src/list.mjs models"
+  }
+}
