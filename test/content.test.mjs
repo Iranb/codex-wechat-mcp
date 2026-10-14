@@ -89,6 +89,16 @@ test('encrypted attachment intake reaches actual model content and pixels; filen
     encrypted.set(String(i),Buffer.concat([cipher.update(bytes),cipher.final()]));
     items.push({type:4,file_item:{file_name:'../../'+name,len:String(bytes.length),media:{encrypt_query_param:String(i),aes_key:key.toString('base64'),encrypt_type:1}}});
   }
+  const imageBytes=await readFile(join(dir,'sample.png')), imageCiphertext=encrypted.get('0');
+  for(const [id,mid_size] of [['inbound-plaintext',imageBytes.length],['inbound-ciphertext',imageCiphertext.length]]) {
+    encrypted.set(id,imageCiphertext);
+    items.push({type:2,image_item:{aeskey:key.toString('hex'),mid_size,media:{encrypt_query_param:id,encrypt_type:1}}});
+  }
+  const jpegBytes=Buffer.concat([await readFile(join(dir,'sample.jpg')),Buffer.alloc(24,0x42)]);
+  const jpegCipher=createCipheriv('aes-128-ecb',key,null);
+  encrypted.set('inbound-jpeg',Buffer.concat([jpegCipher.update(jpegBytes),jpegCipher.final()]));
+  items.push({type:2,image_item:{aeskey:key.toString('hex'),mid_size:jpegBytes.length-100,thumb_size:1234,
+    media:{encrypt_query_param:'inbound-jpeg',encrypt_type:1}}});
   const message={message_type:1,from_user_id:'owner',message_id:'synthetic-media',create_time_ms:Date.now(),context_token:'fake-context',item_list:items};
   const client={getUpdates:async()=>({msgs:[message],get_updates_buf:'next'}),downloadAttachment:a=>downloadAttachment(a,{fetchImpl:async ref=>encrypted.get(ref.query)})};
   assert.equal(await pollOnce(client,store,bridge),1); assert.equal(await pollOnce(client,store,bridge),0);
@@ -96,6 +106,7 @@ test('encrypted attachment intake reaches actual model content and pixels; filen
   const receiveDir=await mkdtemp(join(tmpdir(),'codex-wechat-receive-content-')); t.after(()=>rm(receiveDir,{recursive:true,force:true}));
   claim.claimFile=join(receiveDir,'claim.json'); await writeFile(claim.claimFile,JSON.stringify({status:'claimed',request:claim}),{mode:0o600});
   const input=await modelInput(claim,{statePath});
+  assert.equal(input.filter(item=>item.type==='localImage').length,4);
   assert.equal(input[1].type,'localImage'); assert.ok((await stat(input[1].path)).size>1000);
   const payload=JSON.parse(input[0].text.split('\n').slice(2).join('\n'));
   for(const code of ['PDF-482','DOCX-593','XLSX-264','TEXT-815'])assert.ok(payload.attachments.some(a=>a.content?.includes(code)));

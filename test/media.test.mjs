@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { JsonStore } from '../src/store.mjs';
 import { Bridge } from '../src/bridge.mjs';
 import { LocalQueue } from '../src/local-queue.mjs';
-import { downloadAttachment, fetchCdn, inspectContent, MediaError, normalizeAttachments, saveAttachment, MAX_ATTACHMENT_BYTES } from '../src/media.mjs';
+import { downloadAttachment, fetchCdn, inspectContent, MediaError, normalizeAttachments, saveAttachment, MAX_ATTACHMENT_BYTES, MAX_IMAGE_BYTES } from '../src/media.mjs';
 import { pollOnce } from '../src/wechat.mjs';
 import { attachmentFromClaim } from '../src/attachment-client.mjs';
 
@@ -94,6 +94,101 @@ test('image decrypt uses item hex key and verifies actual pixels format signatur
   assert.equal(result.mime, 'image/png');
   assert.deepEqual(result.bytes, png);
   await assert.rejects(downloadAttachment(attachments[0], { fetchImpl: async () => encrypt(Buffer.alloc(png.length, 65), key) }), /invalid_image_signature/);
+});
+
+test('inbound image variant sizes do not constrain the downloaded original', async () => {
+  const key = randomBytes(16);
+  for (const length of [70684, 139664, 204255]) {
+    const bytes = Buffer.concat([png, Buffer.alloc(length - png.length)]);
+    const ciphertext = encrypt(bytes, key);
+    assert.equal(ciphertext.length, (Math.floor(length / 16) + 1) * 16);
+    for (const mid_size of [length, ciphertext.length, 101814]) {
+      const attachment = normalizeAttachments(raw('image', key, { items: [{ type: 2, image_item: {
+        aeskey: key.toString('hex'), media: media(key), mid_size } }] }))[0];
+      assert.equal(attachment.declaredSizeKind, 'variant_metadata');
+      const result = await downloadAttachment(attachment, { fetchImpl: async () => ciphertext });
+      assert.deepEqual(result.bytes, bytes);
+    }
+  }
+});
+
+test('image variant metadata may be absent or describe other sizes on either download route', async () => {
+  const key = randomBytes(16);
+  const bytes = Buffer.concat([png, Buffer.alloc(204255 - png.length)]), ciphertext = encrypt(bytes, key);
+  for (const ref of [media(key), { full_url: 'https://novac2c.cdn.weixin.qq.com/c2c/download?token=private', aes_key: key.toString('base64') }]) {
+    for (const sizes of [{}, { mid_size: 101814 }, { mid_size: 101814, hd_size: 300000, thumb_size: 1234 },
+      { mid_size: MAX_IMAGE_BYTES + 17, hd_size: MAX_IMAGE_BYTES + 32 }]) {
+      const attachment = normalizeAttachments(raw('image-variants', key, { items: [{ type: 2, image_item: {
+        aeskey: key.toString('hex'), media: ref, ...sizes } }] }))[0];
+      assert.equal(attachment.status, 'pending');
+      assert.deepEqual(attachment.imageSizes, sizes);
+      assert.deepEqual((await downloadAttachment(attachment, { fetchImpl: async () => ciphertext })).bytes, bytes);
+    }
+  }
+});
+
+test('inbound images still reject invalid ciphertext, bad padding, invalid signatures and oversized content', async () => {
+  const key = randomBytes(16), ciphertext = encrypt(png, key);
+  const make = mid_size => normalizeAttachments(raw('image', key, { items: [{ type: 2, image_item: {
+    media: media(key), mid_size } }] }))[0];
+  await assert.rejects(downloadAttachment(make(png.length), { fetchImpl: async () => ciphertext.subarray(0, -1) }), /invalid_ciphertext/);
+  const unpadded = createCipheriv('aes-128-ecb', key, null); unpadded.setAutoPadding(false);
+  const badPadding = Buffer.concat([unpadded.update(Buffer.alloc(32)), unpadded.final()]);
+  await assert.rejects(downloadAttachment(make(32), { fetchImpl: async () => badPadding }), /decryption_failed/);
+  await assert.rejects(downloadAttachment(make(png.length), { fetchImpl: async () => encrypt(Buffer.alloc(png.length, 65), key) }), /invalid_image_signature/);
+  const oversize = Buffer.concat([png, Buffer.alloc(MAX_IMAGE_BYTES + 1 - png.length)]);
+  await assert.rejects(downloadAttachment(make(1), { fetchImpl: async () => encrypt(oversize, key) }), /size_limit/);
+  await assert.rejects(downloadAttachment(make(1), { fetchImpl: async () => Buffer.alloc(MAX_IMAGE_BYTES + 17) }), /size_limit/);
+});
+
+test('unencrypted images use actual size while file images retain exact plaintext len checks', async () => {
+  const key = randomBytes(16), ciphertext = encrypt(png, key);
+  const plainImage = size => normalizeAttachments(raw('image', key, { items: [{ type: 2, image_item: {
+    media: { encrypt_query_param: 'private-query-token' }, mid_size: size } }] }))[0];
+  assert.deepEqual((await downloadAttachment(plainImage(png.length), { fetchImpl: async () => png })).bytes, png);
+  assert.deepEqual((await downloadAttachment(plainImage(png.length + 1), { fetchImpl: async () => png })).bytes, png);
+  const fileImage = len => normalizeAttachments(raw('image-file', key, { items: [{ type: 4, file_item: {
+    file_name: 'photo.png', len: String(len), media: media(key) } }] }))[0];
+  assert.equal(fileImage(png.length).declaredSizeKind, 'plaintext');
+  assert.deepEqual((await downloadAttachment(fileImage(png.length), { fetchImpl: async () => ciphertext })).bytes, png);
+  await assert.rejects(downloadAttachment(fileImage(ciphertext.length), { fetchImpl: async () => ciphertext }), error => {
+    assert.equal(error.code, 'size_mismatch');
+    assert.deepEqual(error.sizeDetails, { stage: 'plaintext', declaredSize: ciphertext.length, plaintextSize: png.length });
+    return true;
+  });
+});
+
+test('JPEG signature accepts trailing data but requires both start and end markers', () => {
+  const jpeg=Buffer.from('ffd8ffe0000201ffd9','hex');
+  assert.equal(inspectContent(Buffer.concat([jpeg,Buffer.alloc(24,0x42)]),{kind:'image'}).mime,'image/jpeg');
+  assert.throws(()=>inspectContent(jpeg.subarray(0,-2),{kind:'image'}),/invalid_image_signature/);
+  assert.throws(()=>inspectContent(Buffer.concat([Buffer.from('not jpeg'),jpeg.subarray(-2)]),{kind:'image'}),/invalid_image_signature/);
+});
+
+test('image with different variant size reaches the local queue as ready without leaking its media reference', async t => {
+  const f = await fixture(t), key = randomBytes(16), ciphertext = encrypt(png, key);
+  const declaredSize = png.length + 1;
+  const message = raw('image-size', key, { items: [{ type: 2, image_item: {
+    aeskey: key.toString('hex'), media: media(key), mid_size: declaredSize } }] });
+  let downloads = 0;
+  const client = { getUpdates: async () => ({ msgs: [message] }), downloadAttachment: a => {
+    downloads++; return downloadAttachment(a, { fetchImpl: async () => ciphertext });
+  } };
+  await pollOnce(client, f.store, f.bridge);
+  f.advance(10000); await pollOnce(client, f.store, f.bridge);
+  assert.equal(downloads, 1);
+  const claim = await f.queue.claim(), item = claim.attachments[0];
+  assert.equal(item.status, 'ready'); assert.equal(item.failure, undefined);
+  assert.deepEqual(await readFile(item.path), png);
+  const stored = (await new JsonStore(f.store.path).load()).data.requests[claim.requestId].attachments[0];
+  assert.equal(stored.size, png.length);
+  assert.equal(stored.sizeDetails, undefined);
+  assert.equal(stored.source, undefined);
+  assert.equal(item.sizeDetails, undefined);
+  for (const secret of ['private-query-token', key.toString('hex'), key.toString('base64')]) {
+    assert.equal(JSON.stringify(stored).includes(secret), false);
+    assert.equal(JSON.stringify(claim).includes(secret), false);
+  }
 });
 
 test('file signatures, filenames, unsupported types, size and decryption failures are bounded', async () => {

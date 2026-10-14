@@ -19,6 +19,7 @@ const mime = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
   '.txt': 'text/plain', '.md': 'text/markdown', '.csv': 'text/csv', '.tsv': 'text/tab-separated-values' };
 export class MediaError extends Error { constructor(code, retryable = false) { super(code); this.code = code; this.retryable = retryable; } }
 const fail = (code, retryable = false) => { throw new MediaError(code, retryable); };
+const sizeMismatch = (details) => { throw Object.assign(new MediaError('size_mismatch'), { sizeDetails: details }); };
 const validSize = (value) => ((typeof value === 'number' && Number.isSafeInteger(value) && value > 0) ||
   (typeof value === 'string' && /^[1-9]\d*$/.test(value) && Number.isSafeInteger(Number(value)))) ? Number(value) : null;
 function safeName(value) {
@@ -50,14 +51,19 @@ export function normalizeAttachments(raw) {
     const ext = image ? '' : extension(name);
     const kind = image ? 'image' : extKinds[ext];
     const declaredSize = validSize(image ? field?.mid_size : field?.len);
-    const max = image ? MAX_IMAGE_BYTES + 16 : MAX_ATTACHMENT_BYTES;
+    const imageSizes = image ? Object.fromEntries(['mid_size', 'hd_size', 'thumb_size']
+      .map(name => [name, validSize(field?.[name])]).filter(([, size]) => size !== null)) : null;
+    // Image variant metadata does not identify the bytes returned by media.
+    // Enforce the image limit on the actual download and decrypted content.
+    const oversized = !image && declaredSize > MAX_ATTACHMENT_BYTES;
     const ref = source(field, image);
     const hasRef = Boolean(field?.media?.encrypt_query_param || field?.media?.full_url);
     if (!ref && !hasRef) continue;
     entries.push({ id: `att_${entries.length}`, name, kind: kind || 'unsupported', extension: ext, declaredSize,
-      declaredSizeKind: image ? 'ciphertext' : 'plaintext',
-      status: !kind || declaredSize && declaredSize > max || !ref ? 'failed' : 'pending',
-      ...(!kind || declaredSize && declaredSize > max || !ref ? { failure: !kind ? 'unsupported_type' : declaredSize && declaredSize > max ? 'size_limit' : 'invalid_media_reference' } : { source: ref }),
+      declaredSizeKind: image ? 'variant_metadata' : 'plaintext',
+      ...(image ? { imageSizes } : {}),
+      status: !kind || oversized || !ref ? 'failed' : 'pending',
+      ...(!kind || oversized || !ref ? { failure: !kind ? 'unsupported_type' : oversized ? 'size_limit' : 'invalid_media_reference' } : { source: ref }),
       attempts: 0, nextAt: 0 });
   }
   if (raw.item_list.filter((item) => item?.type === 2 || item?.type === 4).length > 8) {
@@ -186,11 +192,15 @@ export function inspectContent(bytes, attachment) {
   const max = attachment.kind === 'image' ? MAX_IMAGE_BYTES : MAX_ATTACHMENT_BYTES;
   if (!bytes.length || bytes.length > max) fail('size_limit');
   const declared = attachment.declaredSize;
-  if (declared && (attachment.kind !== 'image' || attachment.declaredSizeKind === 'plaintext') && bytes.length !== declared) fail('size_mismatch');
+  if (declared && (attachment.kind !== 'image' || attachment.declaredSizeKind === 'plaintext') && bytes.length !== declared) {
+    sizeMismatch({ stage: 'plaintext', declaredSize: declared, plaintextSize: bytes.length });
+  }
   let ext = attachment.extension;
   if (attachment.kind === 'image') {
+    // Inbound JPEGs may carry data after EOI. The content reader fully decodes
+    // pixels before model submission, so EOI need not be the final two bytes.
     ext = bytes.subarray(0, 8).equals(Buffer.from('89504e470d0a1a0a', 'hex')) ? '.png' :
-      bytes.subarray(0, 3).equals(Buffer.from('ffd8ff', 'hex')) && bytes.subarray(-2).equals(Buffer.from('ffd9', 'hex')) ? '.jpg' :
+      bytes.subarray(0, 3).equals(Buffer.from('ffd8ff', 'hex')) && bytes.lastIndexOf(Buffer.from('ffd9', 'hex')) >= 3 ? '.jpg' :
       bytes.toString('ascii', 0, 6).match(/^GIF8[79]a$/) ? '.gif' :
       bytes.toString('ascii', 0, 4) === 'RIFF' && bytes.toString('ascii', 8, 12) === 'WEBP' ? '.webp' : '';
     if (!ext) fail('invalid_image_signature');
@@ -216,7 +226,6 @@ export async function downloadAttachment(attachment, { fetchImpl = fetchCdn } = 
   const ref = attachment.source;
   const ciphertext = await fetchImpl(ref, max + (ref.key ? 16 : 0));
   if (!Buffer.isBuffer(ciphertext) || ciphertext.length > max + 16) fail('size_limit');
-  if (attachment.kind === 'image' && attachment.declaredSizeKind !== 'plaintext' && attachment.declaredSize && ciphertext.length !== attachment.declaredSize) fail('size_mismatch');
   const key = parseKey(ref);
   let bytes = ciphertext;
   if (key) {

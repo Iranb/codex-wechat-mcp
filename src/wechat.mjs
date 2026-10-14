@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID } from 'node:crypto';
-import { downloadAttachment, normalizeAttachments, saveAttachment } from './media.mjs';
+import { downloadAttachment, MediaError, normalizeAttachments, saveAttachment } from './media.mjs';
 
 const ROOT = 'https://ilinkai.weixin.qq.com';
 const UIN = Buffer.from(String(randomBytes(4).readUInt32BE())).toString('base64');
@@ -96,7 +96,7 @@ export async function processPendingAttachments(client, store, bridge) {
           const current = state.requests[request.requestId]?.attachments?.find((value) => value.id === attachment.id);
           if (!current || current.status !== 'pending') return;
           Object.assign(current, { status: 'ready', path, mime: result.mime, size: result.bytes.length, sha256: result.sha256 });
-          delete current.source; delete current.failure; delete current.nextAt;
+          delete current.source; delete current.failure; delete current.sizeDetails; delete current.nextAt;
         });
         completed++;
       } catch (error) {
@@ -107,6 +107,8 @@ export async function processPendingAttachments(client, store, bridge) {
           const retry = error.retryable === true && current.attempts < 3;
           current.status = retry ? 'pending' : 'failed';
           current.failure = typeof error.code === 'string' && /^[a-z_]+$/.test(error.code) ? error.code : 'storage_error';
+          delete current.sizeDetails;
+          if (error instanceof MediaError && error.code === 'size_mismatch' && error.sizeDetails) current.sizeDetails = error.sizeDetails;
           current.nextAt = retry ? bridge.clock() + 2000 * 5 ** (current.attempts - 1) : 0;
           if (!retry) delete current.source;
         });
