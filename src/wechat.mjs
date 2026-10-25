@@ -1,6 +1,6 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { downloadAttachment, MediaError, normalizeAttachments, saveAttachment } from './media.mjs';
-import { messageId, normalizeQuotes, parseWechatJson } from './quotes.mjs';
+import { incomingMessageId, normalizeQuotes, parseWechatJson } from './quotes.mjs';
 
 const ROOT = 'https://ilinkai.weixin.qq.com';
 const UIN = Buffer.from(String(randomBytes(4).readUInt32BE())).toString('base64');
@@ -61,23 +61,25 @@ export class WechatClient {
 }
 
 export function normalizeText(raw) {
-  if (raw?.message_type !== 1 || !raw.from_user_id || !messageId(raw.message_id) || !raw.context_token) return null;
+  const messageId = incomingMessageId(raw);
+  if (raw?.message_type !== 1 || !raw.from_user_id || !messageId || !raw.context_token) return null;
   const text = raw.item_list?.filter((item) => item.type === 1 && typeof item.text_item?.text === 'string')
     .map((item) => item.text_item.text).filter((part) => part.trim().length).join('\n');
   if (!text || text.length > 4000) return null;
-  return { userId: raw.from_user_id, messageId: String(raw.message_id), contextToken: raw.context_token,
+  return { userId: raw.from_user_id, messageId, contextToken: raw.context_token,
     text, timestamp: new Date(raw.create_time_ms || Date.now()).toISOString() };
 }
 
 export function normalizeIncoming(raw, { media = false, requireTimestamp = false, state, now = Date.now() } = {}) {
-  if (raw?.message_type !== 1 || !raw.from_user_id || !messageId(raw.message_id) || !raw.context_token || raw.group_id) return null;
+  const messageId = incomingMessageId(raw);
+  if (raw?.message_type !== 1 || !raw.from_user_id || !messageId || !raw.context_token || raw.group_id) return null;
   const text = raw.item_list?.filter((item) => item.type === 1 && typeof item.text_item?.text === 'string')
     .map((item) => item.text_item.text).filter((part) => part.trim().length).join('\n') || '';
   if (text.length > 4000) return null;
   const attachments = media ? normalizeAttachments(raw) : [];
   const quotes = normalizeQuotes(raw, attachments, { media, state, now });
   if (!text && !attachments.length && !quotes.length) return null;
-  return { userId: raw.from_user_id, messageId: String(raw.message_id), contextToken: raw.context_token,
+  return { userId: raw.from_user_id, messageId, contextToken: raw.context_token,
     text, timestamp: requireTimestamp && !(Number.isFinite(raw.create_time_ms) && raw.create_time_ms > 0)
       ? '' : new Date(raw.create_time_ms || now).toISOString(), attachments,
     ...(quotes.length ? { quotes } : {}) };

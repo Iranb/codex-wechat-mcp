@@ -6,8 +6,21 @@ export const MAX_QUOTE_RECORDS = 2000;
 const MAX_QUOTE_CHARS = 16000;
 
 export function messageId(value) {
-  if (typeof value === 'string' && value.length <= 256) return value;
+  if (typeof value === 'string') {
+    const id = value.trim();
+    return id.length <= 256 ? id : '';
+  }
   return Number.isSafeInteger(value) && value >= 0 ? String(value) : '';
+}
+
+export function incomingMessageId(raw) {
+  const topLevel = messageId(raw?.message_id);
+  if (topLevel) return topLevel;
+  for (const item of raw?.item_list || []) {
+    const id = messageId(item?.msg_id);
+    if (id) return id;
+  }
+  return '';
 }
 
 // iLink sends uint64 identifiers as JSON numbers as well as strings.
@@ -91,18 +104,22 @@ export function normalizeQuotes(raw, attachments, { media = false, state, now = 
     if (!ref || typeof ref !== 'object') continue;
     const id = `quote_${quotes.length}`;
     const referenced = ref.message_item;
+    const serverId = messageId(ref.svr_id);
+    const referenceId = serverId || messageId(referenced?.msg_id);
+    const referenceIdField = serverId ? 'svr_id' : 'message_item.msg_id';
     let text = referenced?.type === 1 ? referenced.text_item?.text : referenced?.type === 3 ? referenced.voice_item?.text : '';
     if (typeof text !== 'string') text = '';
     let quotedAttachments = media && referenced ? normalizeAttachments({ message_type: 1, item_list: [referenced] }) : [];
-    let source = 'embedded', origin;
+    let source = text.trim() || quotedAttachments.length ? 'embedded' : referenceId ? 'history' : 'unavailable', origin;
     if (!text.trim() && !quotedAttachments.some(attachment => attachment.status !== 'failed')) {
-      origin = historicalMessage(state, raw.from_user_id, messageId(ref.svr_id), now);
+      origin = historicalMessage(state, raw.from_user_id, referenceId, now);
       if (origin) {
         source = 'history'; text = origin.text;
         quotedAttachments = media ? origin.attachments : [];
       }
     }
     const quote = { id, status: 'ready', source,
+      ...(referenceId ? { referenceId, referenceIdField } : {}),
       ...(typeof ref.title === 'string' && ref.title ? { title: ref.title.slice(0, 512) } : {}) };
     if (ref.partial_text) {
       const selected = selectedText(text, ref.partial_text);
@@ -132,7 +149,8 @@ export function normalizeQuotes(raw, attachments, { media = false, state, now = 
     const hasMedia = attachments.some(value => value.quoteId === id && value.status !== 'failed');
     if (!quote.text && !hasMedia) {
       quote.status = 'unavailable';
-      quote.failure ||= quotedAttachments.find(value => value.failure)?.failure || 'quote_content_unavailable';
+      quote.failure ||= quotedAttachments.find(value => value.failure)?.failure ||
+        (referenceId && !origin ? 'quote_history_miss' : 'quote_content_unavailable');
     } else if (quote.failure || quote.truncated) quote.status = 'partial';
     quotes.push(quote);
   }

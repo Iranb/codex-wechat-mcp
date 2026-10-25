@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { JsonStore } from '../src/store.mjs';
 import { Bridge } from '../src/bridge.mjs';
 import { LocalQueue } from '../src/local-queue.mjs';
-import { normalizeIncoming, pollOnce, WechatClient } from '../src/wechat.mjs';
+import { normalizeIncoming, normalizeText, pollOnce, WechatClient } from '../src/wechat.mjs';
 import { normalizeQuotes, parseWechatJson, rememberQuoteMessage, pruneQuoteMessages, QUOTE_RETENTION_MS, MAX_QUOTE_RECORDS } from '../src/quotes.mjs';
 import { downloadAttachment } from '../src/media.mjs';
 import { startLocalServer } from '../src/local-ipc.mjs';
@@ -74,14 +74,68 @@ test('embedded quoted text stays separate from the current instruction through I
 });
 
 test('API preserves adjacent uint64 IDs in incoming quotes and send receipts', async () => {
-  const body = '{"ret":0,"msgs":[{"message_id":9007199254740993,"item_list":[{"msg_id":9007199254740994,"ref_msg":{"svr_id":9007199254740995}}]}]}';
+  const body = '{"ret":0,"msgs":[{"message_id":9007199254740993,"item_list":[{"msg_id":9007199254740994,"ref_msg":{"svr_id":9007199254740995,"message_item":{"msg_id":9007199254740996}}}]}]}';
   const client = new WechatClient({ fetchImpl: async () => ({ ok: true, text: async () => body }) });
   const response = await client.getUpdates({ token: 'fake', baseUrl: 'https://ilinkai.weixin.qq.com' });
   assert.equal(response.msgs[0].message_id, '9007199254740993');
   assert.equal(response.msgs[0].item_list[0].msg_id, '9007199254740994');
   assert.equal(response.msgs[0].item_list[0].ref_msg.svr_id, '9007199254740995');
+  assert.equal(response.msgs[0].item_list[0].ref_msg.message_item.msg_id, '9007199254740996');
   assert.equal(parseWechatJson('{"ret":0,"message_id":18446744073709551615}').message_id, '18446744073709551615');
   assert.equal(normalizeIncoming(raw(9007199254740992)), null);
+});
+
+test('incoming text and binding accept item IDs while preferring the top-level ID', () => {
+  const message = raw('  top-id  ', '绑定或普通文字');
+  message.item_list[0].msg_id = '  item-id  ';
+  for (const normalize of [normalizeText, normalizeIncoming]) {
+    assert.equal(normalize(message).messageId, 'top-id');
+    assert.equal(normalize({ ...message, message_id: '  ' }).messageId, 'item-id');
+    assert.equal(normalize({ ...message, message_id: undefined }).messageId, 'item-id');
+    assert.equal(normalize(raw(undefined)), null);
+  }
+});
+
+test('item-only incoming messages deduplicate and resolve nested quote IDs after restart through IPC', async t => {
+  const f = await fixture(t);
+  const original = parseWechatJson('{"message_type":1,"from_user_id":"owner","context_token":"private-context","item_list":[{"type":1,"msg_id":9007199254740993,"text_item":{"text":"论文 A 的原文"}}]}');
+  original.create_time_ms = f.now();
+  assert.equal(await f.intake([original]), 1);
+  const received = await f.finish();
+  assert.equal(f.store.data.requests[received.requestId].messageId, '9007199254740993');
+  assert.equal(await f.intake([{ ...original, message_id: '9007199254740993' }]), 0);
+  await f.intake([raw('unrelated', '现在讨论论文 B')]); await f.finish();
+  f.store.data = (await new JsonStore(f.statePath).load()).data;
+  await f.intake([raw('nested-quote', '解读引用', { message_item: { msg_id: ' 9007199254740993 ' } })]);
+  const socketPath = join(f.dir, 'nested.sock');
+  const server = await startLocalServer(f.queue, { socketPath }); t.after(() => server.close());
+  const claim = await receiveOnce(socketPath, { timeoutMs: 1000, emit: () => {} });
+  t.after(() => rm(join(claim.claimFile, '..'), { recursive: true, force: true }));
+  const result = payload(await modelInput(claim, { statePath: f.statePath }));
+  assert.equal(result.quotes[0].text, '论文 A 的原文');
+  assert.equal(result.quotes[0].source, 'history');
+  assert.equal(result.quotes[0].referenceId, '9007199254740993');
+  assert.equal(result.quotes[0].referenceIdField, 'message_item.msg_id');
+});
+
+test('quote ID precedence and missing-history diagnostics identify the exact reference without substituting another', async t => {
+  const f = await fixture(t);
+  await f.intake([raw('primary', '原消息正文'), raw('different', '另一条消息')]);
+  await f.finish(); await f.finish();
+  const read = ref => normalizeIncoming(raw('reference', '解释', ref), { state: f.store.data, now: f.now() });
+  assert.equal(read({ svr_id: ' primary ', message_item: { msg_id: 'different' } }).quotes[0].text, '原消息正文');
+  assert.equal(read({ svr_id: ' ', message_item: { msg_id: 'different' } }).quotes[0].text, '另一条消息');
+  const missing = read({ svr_id: 'not-cached', message_item: { msg_id: 'different' } });
+  assert.equal(missing.quotes[0].status, 'unavailable');
+  assert.equal(missing.quotes[0].failure, 'quote_history_miss');
+  assert.equal(missing.quotes[0].referenceId, 'not-cached');
+  assert.equal(missing.quotes[0].referenceIdField, 'svr_id');
+  const events = [];
+  const input = await modelInput({ ...missing, ownerMatched: true, requestId: 'wx_' + 'b'.repeat(32) }, { emit: event => events.push(event) });
+  assert.match(input[0].text, /先重发原内容/);
+  assert.match(input[0].text, /重复发送同一条引用提问不会补回原内容/);
+  assert.deepEqual(events[0].failures, [{ quoteId: 'quote_0', failure: 'quote_history_miss', source: 'history', referenceIdField: 'svr_id' }]);
+  assert.equal(JSON.stringify(events).includes('not-cached'), false);
 });
 
 test('ID-only quotes restore earlier user text and the exact sent reply segment after restart', async t => {
@@ -98,7 +152,7 @@ test('ID-only quotes restore earlier user text and the exact sent reply segment 
   const quoted = normalizeIncoming(raw('quote-user', '解释', { svr_id: '9007199254740993' }), { media: true, state: restarted.data, now: f.now() });
   assert.equal(quoted.quotes[0].text, '论文 A 的原文');
   const segment = f.sends[1];
-  const quotedReply = normalizeIncoming(raw('quote-reply', '这一段呢', { svr_id: segment.message_id }), { media: true, state: restarted.data, now: f.now() });
+  const quotedReply = normalizeIncoming(raw('quote-reply', '这一段呢', { message_item: { msg_id: segment.message_id } }), { media: true, state: restarted.data, now: f.now() });
   assert.equal(quotedReply.quotes[0].text, segment.text);
   assert.equal(quotedReply.quotes[0].source, 'history');
   assert.notEqual(quotedReply.quotes[0].text, f.sends[0].text);
@@ -109,7 +163,7 @@ test('embedded image and cached image/PDF quotes attach real content; missing ol
   await run(pythonExecutable(), [fileURLToPath(new URL('./make-content-fixtures.py', import.meta.url)), f.dir]);
   f.bytes.set('image', await readFile(join(f.dir, 'sample.png')));
   f.bytes.set('pdf', await readFile(join(f.dir, 'sample.pdf')));
-  const imageItem = { type: 2, image_item: { media: media('image') } };
+  const imageItem = { type: 2, msg_id: 'original-media', image_item: { media: media('image') } };
   const pdfItem = { type: 4, file_item: { file_name: 'paper.pdf', len: String(f.bytes.get('pdf').length), media: media('pdf') } };
   await f.intake([raw('embedded', '解释图中的论文', { message_item: imageItem })]);
   const embedded = await f.queue.claim(), embeddedInput = await modelClaim(f, embedded);
@@ -117,12 +171,12 @@ test('embedded image and cached image/PDF quotes attach real content; missing ol
   assert.equal(payload(embeddedInput).attachments[0].quoteId, 'quote_0');
   assert.equal(payload(embeddedInput).attachments[0].pixelsAttached, true);
   await f.queue.reply({ requestId: embedded.requestId, claimId: embedded.claimId, text: '图片已读取' });
-  await f.intake([raw('original-media', '', undefined, { item_list: [imageItem, pdfItem] })]);
+  await f.intake([raw(undefined, '', undefined, { item_list: [imageItem, pdfItem] })]);
   const original = await f.finish();
   const beforeDownloads = f.downloads();
   const restarted = await new JsonStore(f.statePath).load();
   f.store.data = restarted.data;
-  await f.intake([raw('id-only-media', '解读引用', { svr_id: 'original-media' })]);
+  await f.intake([raw('id-only-media', '解读引用', { message_item: { msg_id: 'original-media' } })]);
   const claim = await f.queue.claim(), input = await modelClaim(f, claim), result = payload(input);
   assert.equal(f.downloads(), beforeDownloads);
   assert.equal(claim.attachments[0].path, original.attachments[0].path);
