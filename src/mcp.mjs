@@ -1,12 +1,13 @@
 import { attachJsonLines, sendJsonLine } from './framing.mjs';
+import { MAX_REPLY_CHARS } from './reply.mjs';
 
 const VERSION = '2026-07-28';
 const SERVER_INFO = { name: 'codex-wechat-mcp', version: '0.1.0' };
 const replyTool = {
   name: 'reply_to_wechat_request',
   title: 'Reply to the current WeChat request',
-  description: 'Send one text reply to the bound WeChat user for a pending requestId from a wechat.message.created event. A request expires after 24 hours. Acceptance by the WeChat API is not a delivery receipt.',
-  inputSchema: { type: 'object', properties: { requestId: { type: 'string' }, text: { type: 'string', maxLength: 800 } }, required: ['requestId', 'text'], additionalProperties: false },
+  description: 'Send a text reply to the bound WeChat user for a pending requestId from a wechat.message.created event. Long replies are sent as ordered numbered messages. A request expires after 24 hours. Acceptance by the WeChat API is not a delivery receipt.',
+  inputSchema: { type: 'object', properties: { requestId: { type: 'string' }, text: { type: 'string', maxLength: MAX_REPLY_CHARS } }, required: ['requestId', 'text'], additionalProperties: false },
   annotations: { destructiveHint: false, openWorldHint: true, idempotentHint: true },
 };
 

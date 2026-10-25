@@ -3,6 +3,7 @@ import { lstat, open, readFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { attachJsonLines } from './framing.mjs';
 import { CODEX, MODEL, INSTRUCTIONS, rpcError } from './native-client.mjs';
+import { MAX_REPLY_CHARS } from './reply.mjs';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
@@ -91,13 +92,13 @@ export class ExecClient {
           if (code !== 0) throw new Error(stderrFailure || 'exec_completion_unconfirmed');
           if (!started || !completed || turnCount !== 1 || completionCount !== 1) throw new Error('exec_completion_unconfirmed');
           const info = await lstat(outputPath);
-          if (!info.isFile() || info.isSymbolicLink() || info.uid !== process.getuid() || (info.mode & 0o077) || info.size > 16_384) throw new Error('exec_final_reply_invalid');
+          if (!info.isFile() || info.isSymbolicLink() || info.uid !== process.getuid() || (info.mode & 0o077) || info.size > MAX_REPLY_CHARS * 4) throw new Error('exec_final_reply_invalid');
           const reply = (await readFile(outputPath, 'utf8')).trim();
           const all = [...messages.values()];
           const finals = all.filter(item => item.phase === 'final_answer');
           const candidates = finals.length ? finals : all.filter(item => item.phase == null);
           const last = candidates.at(-1)?.text?.trim();
-          if (!reply || reply.length > 800 || last !== reply) throw new Error('exec_final_reply_invalid');
+          if (!reply || reply.length > MAX_REPLY_CHARS || last !== reply) throw new Error('exec_final_reply_invalid');
           emit({ event: 'exec_turn_completed', threadId, model: MODEL, usage });
           resolve({ reply, usage });
         } catch (error) { reject(error); }

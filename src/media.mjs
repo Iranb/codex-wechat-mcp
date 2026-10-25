@@ -74,8 +74,10 @@ export function normalizeAttachments(raw) {
 }
 export function publicAttachment(value, includePath = false) {
   return { id: value.id, name: value.name, kind: value.kind, status: value.status,
+    ...(value.quoteId ? { quoteId: value.quoteId } : {}),
     ...(value.mime ? { mime: value.mime } : {}), ...(value.size ? { size: value.size } : {}),
-    ...(value.failure ? { failure: value.failure } : {}), ...(includePath && value.status === 'ready' ? { path: value.path, sha256: value.sha256 } : {}) };
+    ...(value.failure ? { failure: value.failure } : {}), ...(includePath && value.status === 'ready' ? { path: value.path, sha256: value.sha256,
+      ...(value.sourceRequestId ? { sourceRequestId: value.sourceRequestId, sourceAttachmentId: value.sourceAttachmentId } : {}) } : {}) };
 }
 function mediaUrl(ref) {
   const raw = ref.fullUrl || (ref.query ? `${CDN}?encrypted_query_param=${encodeURIComponent(ref.query)}` : '');

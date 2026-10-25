@@ -79,6 +79,22 @@ test('exit success without turn completion or with an inconsistent final file ca
   }
 });
 
+test('verified long CLI replies are retained intact beyond both previous size limits', async t => {
+  const dir = await directory(t);
+  for (const length of [2717, 12000]) {
+    const outputPath = join(dir, `${length}.txt`);
+    const reply = '字'.repeat(length);
+    const client = new ExecClient({ spawnChild: fakeSpawn(async ({ child }) => {
+      events(child, [{ type: 'thread.started', thread_id: threadId }, { type: 'turn.started' },
+        { type: 'item.completed', item: { id: 'final', type: 'agent_message', phase: 'final_answer', text: reply } },
+        { type: 'turn.completed' }]);
+      await writeFile(outputPath, reply); child.emit('close', 0);
+    }) });
+    const result = await client.run({ threadId, cwd: dir, outputPath, input: [{ type: 'text', text: 'test' }] });
+    assert.equal(result.reply, reply);
+  }
+});
+
 test('a different thread or an aborted execution is killed and never returns a reply', async t => {
   const dir = await directory(t);
   for (const mode of ['wrong-thread', 'abort']) {
@@ -164,6 +180,29 @@ test('interrupted exec recovers only a unique completed original turn, never inv
     { id: 'a', type: 'agentMessage', phase: 'final_answer', text: 'saved reply' }] });
   await f.controller.processActive();
   assert.deepEqual(f.sent, ['saved reply']); assert.equal(f.exec.calls, 0);
+});
+
+test('a completed long reply is recovered and split, then the next request runs normally', async t => {
+  const f = await fixture(t);
+  await f.bridge.incoming(f.message('long'));
+  await f.controller.claim();
+  const id = f.journal.data.active.requestId;
+  await f.journal.update(data => { data.active.stage = 'running'; data.active.delivery = 'codex_exec'; });
+  const reply = '字'.repeat(2717);
+  f.turns.push({ id: 'saved-long-turn', status: 'completed', items: [
+    { id: 'u-long', type: 'userMessage', content: [{ type: 'text', text: marker(id) + '\nowner input' }] },
+    { id: 'a-long', type: 'agentMessage', phase: 'final_answer', text: reply }] });
+  await f.controller.processActive();
+  assert.equal(f.sent.length, 4);
+  assert.equal(f.sent.map(s => s.replace(/^\(\d+\/\d+\)\n/, '')).join(''), reply);
+  assert.equal(f.exec.calls, 0);
+  await f.bridge.incoming(f.message('next'));
+  await f.controller.claim();
+  await f.controller.processActive();
+  assert.equal(f.sent.at(-1), 'reply-1');
+  assert.equal(f.exec.calls, 1);
+  assert.equal(f.journal.data.completed, 2);
+  assert.equal(f.journal.data.active, null);
 });
 
 test('receive exclusions work over IPC and cannot revive an excluded saved claim', async t => {

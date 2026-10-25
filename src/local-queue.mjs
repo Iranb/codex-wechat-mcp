@@ -2,6 +2,7 @@ import { EventEmitter } from 'node:events';
 import { createHash, randomUUID } from 'node:crypto';
 import { MAX_AGE } from './bridge.mjs';
 import { publicAttachment } from './media.mjs';
+import { MAX_REPLY_CHARS } from './reply.mjs';
 
 const DEFAULT_LEASE = 600_000;
 const integer = (value, min, max, label) => {
@@ -48,6 +49,7 @@ export class LocalQueue {
 
   publicClaim(request) {
     return { requestId: request.requestId, text: request.text, timestamp: request.timestamp, ownerMatched: true,
+      ...(request.quotes?.length ? { quotes: structuredClone(request.quotes) } : {}),
       ...(request.attachments?.length ? { attachments: request.attachments.map((item) => publicAttachment(item, true)) } : {}),
       claimId: request.localQueue.claimId, leaseExpiresAt: new Date(request.localQueue.leaseExpiresAt).toISOString() };
   }
@@ -103,9 +105,11 @@ export class LocalQueue {
     const queue = request?.localQueue;
     if (!request || request.userId !== this.store.data.account?.boundUserId || !claimId ||
       (queue?.claimId !== claimId && queue?.expiredClaimId !== claimId)) throw new Error('claim does not match request');
-    if (text !== undefined && (typeof text !== 'string' || !text.trim() || text.length > 800)) throw new Error('invalid reply text');
+    if (text !== undefined && (typeof text !== 'string' || !text.trim() || text.length > MAX_REPLY_CHARS)) throw new Error('invalid reply text');
     return { requestId, status: request.status, queueStatus: queue.status,
       ...(text === undefined ? {} : { replyMatches: request.replyDigest === createHash('sha256').update(text).digest('hex') }),
+      ...(request.replyParts ? { replyProgress: { total: request.replyParts.length,
+        accepted: request.replyParts.filter(part => part.status === 'accepted').length } } : {}),
       leaseActive: ['claimed', 'acked'].includes(queue.status) && queue.leaseExpiresAt > this.bridge.clock() };
   }
 

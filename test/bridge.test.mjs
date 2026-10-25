@@ -95,7 +95,7 @@ test('binding consumes only the matching fresh phrase and does not create an eve
 
 test('WeChat client sends the request context token to the official endpoint shape', async () => {
   let observed;
-  const client = new WechatClient({ fetchImpl: async (url, options) => { observed = { url: url.toString(), options }; return { ok: true, json: async () => ({ ret: 0 }) }; } });
+  const client = new WechatClient({ fetchImpl: async (url, options) => { observed = { url: url.toString(), options }; return { ok: true, text: async () => '{"ret":0}' }; } });
   await client.sendText({ token: 'fake', baseUrl: 'https://ilinkai.weixin.qq.com' }, { userId: 'owner', contextToken: 'context' }, 'Hi');
   assert.equal(new URL(observed.url).pathname, '/ilink/bot/sendmessage');
   assert.equal(JSON.parse(observed.options.body).msg.context_token, 'context');

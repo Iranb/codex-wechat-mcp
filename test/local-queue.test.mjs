@@ -236,12 +236,12 @@ globalThis.fetch = async (url, options) => {
   const path = new URL(url).pathname;
   if (path === '/ilink/bot/sendmessage') {
     await writeFile(${JSON.stringify(sendPath)}, JSON.stringify({ sends: ++sends, body: JSON.parse(options.body) }));
-    return { ok: true, json: async () => ({ ret: 0 }) };
+    return { ok: true, text: async () => JSON.stringify({ ret: 0 }) };
   }
   if (path !== '/ilink/bot/getupdates') throw new Error('all other network requests forbidden');
-  if (first) { first = false; return { ok: true, json: async () => ({ msgs: [${JSON.stringify(raw('integration'))}], get_updates_buf: 'fake-cursor' }) }; }
+  if (first) { first = false; return { ok: true, text: async () => JSON.stringify({ msgs: [${JSON.stringify(raw('integration'))}], get_updates_buf: 'fake-cursor' }) }; }
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => resolve({ ok: true, json: async () => ({ msgs: [] }) }), 100);
+    const timer = setTimeout(() => resolve({ ok: true, text: async () => JSON.stringify({ msgs: [] }) }), 100);
     options.signal.addEventListener('abort', () => { clearTimeout(timer); reject(new Error('cancelled fake poll')); }, { once: true });
     if (options.signal.aborted) { clearTimeout(timer); reject(new Error('cancelled fake poll')); }
   });

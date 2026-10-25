@@ -25,8 +25,13 @@ export async function attachmentFromClaim({ claimFile, attachmentId }, { statePa
   const item = request.attachments?.find((value) => value.id === attachmentId);
   if (!item || item.status !== 'ready' || typeof item.path !== 'string' || !/^[a-f0-9]{64}$/.test(item.sha256 || '')) throw new Error('attachment not ready');
   const root = join(dirname(statePath), 'attachments');
-  const folder = join(root, request.requestId);
-  const expected = join(folder, `${attachmentId}${/\.[a-z0-9]{1,8}$/i.exec(item.path)?.[0] || ''}`);
+  const sourceRequestId = item.sourceRequestId || request.requestId;
+  const sourceAttachmentId = item.sourceAttachmentId || attachmentId;
+  if (!/^wx_[a-f0-9]{32}$/.test(sourceRequestId) || !/^att_[0-7]$/.test(sourceAttachmentId) ||
+      ((item.sourceRequestId || item.sourceAttachmentId) && !request.quotes?.some(quote =>
+        quote.id === item.quoteId && quote.attachmentIds?.includes(attachmentId)))) throw new Error('invalid quoted attachment source');
+  const folder = join(root, sourceRequestId);
+  const expected = join(folder, `${sourceAttachmentId}${/\.[a-z0-9]{1,8}$/i.exec(item.path)?.[0] || ''}`);
   if (resolve(item.path) !== resolve(expected)) throw new Error('attachment path mismatch');
   const rootInfo = await lstat(root), folderInfo = await lstat(folder);
   for (const info of [rootInfo, folderInfo]) {
@@ -41,5 +46,6 @@ export async function attachmentFromClaim({ claimFile, attachmentId }, { statePa
   const type = inspectContent(bytes, { kind: item.kind, extension });
   if (type.mime !== item.mime) throw new Error('attachment type mismatch');
   return { requestId: request.requestId, attachmentId, name: item.name, kind: item.kind, mime: item.mime,
+    ...(item.quoteId ? { quoteId: item.quoteId } : {}),
     size: item.size, sha256: item.sha256, path: item.path };
 }

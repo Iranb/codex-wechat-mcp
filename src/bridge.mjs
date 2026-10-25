@@ -1,6 +1,8 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { lookup } from 'node:dns/promises';
 import { postCallback, resolveCallback, signWebhook, validateSecret, equalText } from './webhook.mjs';
+import { MAX_REPLY_CHARS, splitReply } from './reply.mjs';
+import { rememberQuoteMessage, pruneQuoteMessages } from './quotes.mjs';
 
 const hash = (value) => createHash('sha256').update(value).digest('hex').slice(0, 32);
 export const MAX_AGE = 24 * 60 * 60 * 1000;
@@ -27,13 +29,13 @@ export class Bridge {
     if (this.mode === 'local-queue') return [];
     return [{ name: EVENT, description: 'A new text message from the owner-bound WeChat sender.', delivery: ['webhook'],
       inputSchema: { type: 'object', properties: {}, additionalProperties: false },
-      payloadSchema: { type: 'object', properties: { requestId: { type: 'string' }, text: { type: 'string' }, timestamp: { type: 'string' } },
+      payloadSchema: { type: 'object', properties: { requestId: { type: 'string' }, text: { type: 'string' }, timestamp: { type: 'string' }, quotes: { type: 'array', items: { type: 'object' } } },
         required: ['requestId', 'text', 'timestamp'], additionalProperties: false } }];
   }
 
-  recordIncoming(state, { userId, messageId, contextToken, text, timestamp, attachments = [] }) {
+  recordIncoming(state, { userId, messageId, contextToken, text, timestamp, attachments = [], quotes = [] }) {
     if (userId !== state.account?.boundUserId) return null;
-    if (typeof text !== 'string' || (!text.trim() && !attachments.length) || text.length > 4000 || !messageId || !contextToken) return null;
+    if (typeof text !== 'string' || (!text.trim() && !attachments.length && !quotes.length) || text.length > 4000 || !messageId || !contextToken) return null;
     if (attachments.length && this.mode !== 'local-queue') return null;
     const requestId = `wx_${hash(`${state.account.accountId}\0${userId}\0${messageId}`)}`;
     if (state.requests[requestId]) return null;
@@ -42,6 +44,7 @@ export class Bridge {
     state.requests[requestId] = { requestId, eventId: `evt_${requestId}`, userId, messageId: String(messageId), contextToken, text, timestamp,
       createdAt: this.clock(), status: 'pending', route: this.mode,
       ...(attachments.length ? { attachments } : {}),
+      ...(quotes.length ? { quotes } : {}),
       targets: this.mode === 'webhook' ? Object.fromEntries(targets.map((id) => [id, { attempts: 0, nextAt: 0 }])) : {},
       ...(this.mode === 'local-queue' ? { ingressSequence: state.localIngressSequence, localQueue: { status: 'pending', attempts: 0 } } : {}) };
     if (this.mode === 'local-queue' && state.localQueueResumeAt &&
@@ -52,6 +55,9 @@ export class Bridge {
       request.skippedReason = 'before_forwarding_resume';
       delete request.text; delete request.contextToken;
       for (const item of request.attachments || []) delete item.source;
+      delete request.quotes;
+    } else {
+      rememberQuoteMessage(state, { userId, id: messageId, text, requestId }, this.clock());
     }
     return requestId;
   }
@@ -69,12 +75,15 @@ export class Bridge {
   }
 
   prune(state) {
+    pruneQuoteMessages(state, this.clock());
     for (const [id, request] of Object.entries(state.requests)) {
       const age = this.clock() - request.createdAt;
       if (age > 30 * MAX_AGE) { delete state.requests[id]; continue; }
       if (age >= MAX_AGE) {
         delete request.text;
         delete request.contextToken;
+        delete request.quotes;
+        for (const part of request.replyParts || []) delete part.text;
         for (const item of request.attachments || []) delete item.source;
         delete request.targets;
         if (request.status === 'pending') request.status = 'expired';
@@ -88,8 +97,19 @@ export class Bridge {
       this.prune(state);
       for (const request of Object.values(state.requests)) {
         if (request.status === 'sending') {
-          request.status = 'unconfirmed';
-          if (request.localQueue) request.localQueue.status = 'blocked';
+          const parts = request.replyParts;
+          if (parts?.length && parts.every(part => ['pending', 'accepted'].includes(part.status))) {
+            request.status = parts.every(part => part.status === 'accepted') ? 'accepted'
+              : this.clock() - request.createdAt >= MAX_AGE ? 'expired' : 'pending';
+            if (request.status === 'accepted') {
+              delete request.contextToken;
+              if (request.localQueue) request.localQueue.status = 'done';
+            }
+          } else {
+            request.status = 'unconfirmed';
+            for (const part of parts || []) if (part.status === 'sending') part.status = 'unconfirmed';
+            if (request.localQueue) request.localQueue.status = 'blocked';
+          }
         }
         const queue = request.localQueue;
         if (request.status === 'pending' && queue && ['claimed', 'acked'].includes(queue.status) && queue.leaseExpiresAt <= this.clock()) {
@@ -168,7 +188,8 @@ export class Bridge {
         const sub = this.store.data.subscriptions[id];
         if (!sub || sub.expiresAt <= this.clock() || target.done || target.attempts >= 8 || target.nextAt > this.clock()) continue;
         const event = { eventId: request.eventId, name: EVENT, timestamp: request.timestamp,
-          data: { requestId: request.requestId, text: request.text, timestamp: request.timestamp }, cursor: null };
+          data: { requestId: request.requestId, text: request.text, timestamp: request.timestamp,
+            ...(request.quotes?.length ? { quotes: request.quotes } : {}) }, cursor: null };
         let status;
         try { const response = await this.sendWebhook(sub, event); status = response.ok ? 200 : response.status; }
         catch { status = 0; }
@@ -186,7 +207,8 @@ export class Bridge {
 
   async reply(requestId, text, { claimId } = {}) {
     requestId = textValue(requestId, 128, 'request id');
-    text = textValue(text, 800, 'reply text', true);
+    text = textValue(text, MAX_REPLY_CHARS, 'reply text', true);
+    const parts = splitReply(text);
     const replyDigest = createHash('sha256').update(text).digest('hex');
     let duplicate = false;
     await this.store.update((state) => {
@@ -202,26 +224,46 @@ export class Bridge {
       }
       if (current.status !== 'pending') throw new Error(`request ${current.status}; manual reconciliation required`);
       if (queue && (!['claimed', 'acked'].includes(queue.status) || queue.leaseExpiresAt <= this.clock())) throw new Error('claim expired or not active');
+      if (current.replyDigest && current.replyDigest !== replyDigest) throw new Error('a different reply was already recorded');
+      if (current.replyParts?.some(part => !['pending', 'accepted'].includes(part.status))) throw new Error('WeChat send unconfirmed; manual reconciliation required');
       current.status = 'sending';
-      current.sendClientId = randomUUID();
       current.replyDigest = replyDigest;
+      current.replyParts ||= parts.map(text => ({ text, status: 'pending', sendClientId: randomUUID() }));
     });
     if (duplicate) return { status: 'accepted', duplicate: true };
-    try {
-      const request = this.store.data.requests[requestId];
-      await this.client.sendText(this.store.data.account, request, text);
+    for (let index = 0; index < this.store.data.requests[requestId].replyParts.length; index++) {
+      if (this.store.data.requests[requestId].replyParts[index].status === 'accepted') continue;
+      // A persisted pending part has never crossed the network send boundary.
       await this.store.update((state) => {
-        state.requests[requestId].status = 'accepted';
-        delete state.requests[requestId].contextToken;
-        if (state.requests[requestId].localQueue) state.requests[requestId].localQueue.status = 'done';
+        const current = state.requests[requestId];
+        if (this.clock() - current.createdAt >= MAX_AGE) throw new Error('request expired');
+        current.replyParts[index].status = 'sending';
       });
-      return { status: 'accepted', duplicate: false };
-    } catch {
-      await this.store.update((state) => {
-        state.requests[requestId].status = 'unconfirmed';
-        if (state.requests[requestId].localQueue) state.requests[requestId].localQueue.status = 'blocked';
-      });
-      throw new Error('WeChat send unconfirmed; do not retry automatically');
+      try {
+        const request = this.store.data.requests[requestId];
+        const part = request.replyParts[index];
+        const sent = await this.client.sendText(this.store.data.account, { ...request, sendClientId: part.sendClientId }, part.text);
+        await this.store.update((state) => {
+          const current = state.requests[requestId];
+          rememberQuoteMessage(state, { userId: current.userId, id: sent?.message_id, text: part.text }, this.clock());
+          current.replyParts[index].status = 'accepted';
+          delete current.replyParts[index].text;
+          if (index === current.replyParts.length - 1) {
+            current.status = 'accepted';
+            delete current.contextToken;
+            if (current.localQueue) current.localQueue.status = 'done';
+          }
+        });
+      } catch {
+        await this.store.update((state) => {
+          const current = state.requests[requestId];
+          current.status = 'unconfirmed';
+          current.replyParts[index].status = 'unconfirmed';
+          if (current.localQueue) current.localQueue.status = 'blocked';
+        });
+        throw new Error('WeChat send unconfirmed; do not retry automatically');
+      }
     }
+    return { status: 'accepted', duplicate: false };
   }
 }

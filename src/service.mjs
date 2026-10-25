@@ -65,7 +65,7 @@ export async function serviceAction(action, { dryRun = false } = {}) {
     try {
       const managed = join(config.stateDir, 'launchd'); await privateDirectory(managed); await privateDirectory(config.appDir);
       await cp(join(projectDir, 'src'), join(config.appDir, 'src'), { recursive: true, errorOnExist: true, force: false });
-      for (const name of ['package.json', 'README.md', 'LICENSE', 'requirements.txt', 'THIRD_PARTY_NOTICES.md'])
+      for (const name of ['package.json', 'README.md', 'QUOTES.md', 'LICENSE', 'requirements.txt', 'THIRD_PARTY_NOTICES.md'])
         await cp(join(projectDir, name), join(config.appDir, name), { errorOnExist: true, force: false });
       await writePrivateJson(join(managed, 'config.json'), config);
       await mkdir(agentsDir, { recursive: true });

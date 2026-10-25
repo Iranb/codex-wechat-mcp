@@ -5,6 +5,7 @@ import { join, dirname, basename } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as pause } from 'node:timers/promises';
 import { localCall } from './local-ipc.mjs';
+import { MAX_REPLY_CHARS } from './reply.mjs';
 
 const KIND = 'codex-wechat-receive-v1';
 const emitDefault = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
@@ -36,6 +37,7 @@ async function control(dir) {
 const disconnected = (error) => ['ENOENT', 'ECONNREFUSED', 'ECONNRESET', 'EPIPE'].includes(error.code) || error.message === 'local bridge disconnected';
 const publicResult = (request, claimFile) => ({ status: 'claimed', requestId: request.requestId, text: request.text,
   ownerMatched: request.ownerMatched, claimFile,
+  ...(request.quotes?.length ? { quotes: request.quotes } : {}),
   ...(request.attachments?.length ? { attachments: request.attachments.map(({ path: _path, ...item }) => item) } : {}) });
 
 // One process returns one message. Empty timeout responses and reconnects stay
@@ -136,7 +138,7 @@ export async function cancelReceive(socketPath, { controlDir }) {
 }
 
 export async function respondFromClaim(socketPath, { requestId, claimFile, text }) {
-  if (typeof text !== 'string' || !text.trim() || text.length > 800 || basename(claimFile || '') !== 'claim.json') throw new Error('exact parent reply and private claim file required');
+  if (typeof text !== 'string' || !text.trim() || text.length > MAX_REPLY_CHARS || basename(claimFile || '') !== 'claim.json') throw new Error('exact parent reply and private claim file required');
   const dir = dirname(claimFile);
   await control(dir);
   let claim = await privateJson(claimFile);

@@ -1,8 +1,9 @@
 import net from 'node:net';
 import { mkdir, chmod, lstat, unlink } from 'node:fs/promises';
 import { dirname, isAbsolute } from 'node:path';
+import { REPLY_FRAME_BYTES } from './reply.mjs';
 
-const LIMIT = 32_768;
+const LIMIT = REPLY_FRAME_BYTES;
 const allowed = {
   wait: ['command', 'timeoutMs', 'leaseMs', 'matchText', 'workerId', 'excludeRequestIds'],
   activate: ['command', 'activationAt'],

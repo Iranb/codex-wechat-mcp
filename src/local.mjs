@@ -3,13 +3,14 @@ import { localCall } from './local-ipc.mjs';
 import { receiveOnce, cancelReceive, respondFromClaim } from './receive-client.mjs';
 import { attachmentFromClaim } from './attachment-client.mjs';
 import { statePath, localSocketPath } from './runtime.mjs';
+import { REPLY_FRAME_BYTES } from './reply.mjs';
 
 const emit = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
 async function inputJson() {
   let input = '';
   for await (const chunk of process.stdin) {
     input += chunk;
-    if (Buffer.byteLength(input) > 32_768) throw new Error('stdin JSON too large');
+    if (Buffer.byteLength(input) > REPLY_FRAME_BYTES) throw new Error('stdin JSON too large');
   }
   let record;
   try { record = JSON.parse(input); }
